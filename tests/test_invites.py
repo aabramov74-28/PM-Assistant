@@ -86,6 +86,56 @@ def main() -> None:
         check("Аудит: user_invited и user_activated зафиксированы",
               {"user_invited", "user_activated"} <= actions)
 
+        # --- Парсер списка участников (/addteam) ---
+        from app.services import parse_member_list
+
+        parsed = parse_member_list(
+            "# команда пилота\n"
+            "Мария Сидорова, @msidorova, m.sidorova@company.ru\n"
+            "Алексей Ким\n"
+            "Игорь Волков, i.volkov@company.ru\n"
+            "Иван, Петров, @ivanpetrov\n"
+            "\n")
+        valid = [p for p in parsed if "error" not in p]
+        check("Парсер: 4 участника, пустая строка и # пропущены",
+              len(valid) == 4, f"n={len(valid)}")
+        check("Парсер: полная строка",
+              valid[0] == {"line": 2, "name": "Мария Сидорова",
+                           "username": "msidorova",
+                           "email": "m.sidorova@company.ru"}, str(valid[0]))
+        check("Парсер: только имя",
+              valid[1]["username"] is None and valid[1]["email"] is None)
+        check("Парсер: имя + email без username",
+              valid[2]["email"] == "i.volkov@company.ru"
+              and valid[2]["username"] is None)
+        check("Парсер: имя из двух частей без запятой",
+              valid[3]["name"] == "Иван Петров"
+              and valid[3]["username"] == "ivanpetrov")
+
+        bad = parse_member_list("!\n,\nХ")
+        check("Парсер: битые строки → ошибки, мусор пропускается",
+              len(bad) == 2 and all("error" in p for p in bad), str(bad))
+
+        # --- Массовое добавление с дедупликацией ---
+        created, skipped = [], []
+        for m in valid:
+            if m["username"] and repo.get_user_by_username(m["username"]):
+                skipped.append(m["name"])
+                continue
+            if m["email"] and repo.get_user_by_email(m["email"]):
+                skipped.append(m["name"])
+                continue
+            created.append(repo.create_invited_user(
+                m["name"], "executor", pm["id"],
+                username=m["username"], email=m["email"]))
+        # «Мария Сидорова» уже приглашена выше с тем же username/email
+        check("Дедупликация: существующая Мария пропущена",
+              skipped == ["Мария Сидорова"], str(skipped))
+        check("Массовое добавление: 3 новых",
+              len(created) == 3, f"n={len(created)}")
+        check("У каждого нового — свой токен",
+              len({u["invite_token"] for u in created}) == 3)
+
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО тестов: {FAILED}")

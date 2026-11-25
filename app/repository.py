@@ -83,6 +83,11 @@ class Repository:
         return self.conn.execute(
             "SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
 
+    def get_user_by_username(self, username: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM users WHERE username=?",
+            (username.lstrip("@").lower(),)).fetchone()
+
     def get_user_by_email(self, email: str) -> sqlite3.Row | None:
         """Поиск по e-mail (из From: может прийти 'Имя <addr@dom>')."""
         addr = email.lower()

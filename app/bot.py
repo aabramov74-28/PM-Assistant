@@ -17,7 +17,8 @@ from .integrations.calendar_sync import CalendarSync
 from .integrations.llm import LLMModule
 from .repository import ACTIVE_STATUSES, PRIORITY_LABELS, STATUS_LABELS, Repository
 from .services import (FREQUENCY_LABELS, build_daily_digest,
-                       build_status_report_data, fmt_date, task_line)
+                       build_status_report_data, fmt_date, parse_member_list,
+                       task_line)
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ REG_NAME, REG_EMAIL, REG_ROLE = range(3)
 (NT_PROJECT, NT_TITLE, NT_DESC, NT_ASSIGNEE, NT_DEADLINE, NT_PRIORITY) = range(10, 16)
 ST_TEXT = 20
 AM_NAME, AM_USERNAME, AM_EMAIL, AM_ROLE = range(30, 34)
+AT_LIST, AT_ROLE = range(40, 42)
 
 TASK_CODE = re.compile(r"^TASK-\d{3,}$", re.IGNORECASE)
 
@@ -214,6 +216,76 @@ async def am_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Отправьте ему ссылку-приглашение — по ней аккаунт привяжется "
         f"автоматически (бот не может написать первым):\n{link}\n\n"
         f"До активации напоминания будут приходить на e-mail, если он указан.")
+    return ConversationHandler.END
+
+
+# ------------------------------------------------- /addteam (массово)
+
+async def addteam_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """PM добавляет команду списком: по одному участнику на строку."""
+    user = current_user(update, context)
+    if not is_pm(user, update.effective_user.id):
+        await update.message.reply_text("Добавлять участников может PM.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Отправьте список участников — по одному на строку:\n"
+        "«Имя Фамилия, @username, email» (username и email необязательны).\n\n"
+        "Пример:\n"
+        "Мария Сидорова, @msidorova, m.sidorova@company.ru\n"
+        "Алексей Ким\n"
+        "Игорь Волков, i.volkov@company.ru\n\n"
+        "Строки с # игнорируются. Отмена: /cancel")
+    return AT_LIST
+
+
+async def at_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parsed = parse_member_list(update.message.text)
+    valid = [p for p in parsed if "error" not in p]
+    errors = [p for p in parsed if "error" in p]
+    if not valid:
+        await update.message.reply_text(
+            "Не удалось распознать ни одного участника. Проверьте формат "
+            "и попробуйте ещё раз (или /cancel).")
+        return AT_LIST
+    context.user_data["at_members"] = valid
+    if errors:
+        await update.message.reply_text(
+            "⚠️ Строки пропущены:\n" + "\n".join(p["error"] for p in errors))
+    keyboard = [[
+        InlineKeyboardButton("Исполнители", callback_data="at_role:executor"),
+        InlineKeyboardButton("PM", callback_data="at_role:pm"),
+    ]]
+    await update.message.reply_text(
+        f"Распознано участников: {len(valid)}. Роль для всех:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return AT_ROLE
+
+
+async def at_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    role = query.data.split(":", 1)[1]
+    r = repo(context)
+    pm = current_user(update, context)
+    bot_username = (await context.application.bot.get_me()).username
+    lines, skipped = [], []
+    for m in context.user_data["at_members"]:
+        # дедупликация: по username, затем по e-mail
+        if m["username"] and r.get_user_by_username(m["username"]):
+            skipped.append(f"{m['name']} — @{m['username']} уже зарегистрирован")
+            continue
+        if m["email"] and r.get_user_by_email(m["email"]):
+            skipped.append(f"{m['name']} — {m['email']} уже зарегистрирован")
+            continue
+        user = r.create_invited_user(
+            name=m["name"], role=role,
+            author_id=pm["id"] if pm else None,
+            username=m["username"], email=m["email"])
+        lines.append(f"{user['name']}:\nhttps://t.me/{bot_username}?start=inv_{user['invite_token']}")
+    text = f"✅ Добавлено: {len(lines)}. Ссылки-приглашения:\n\n" + "\n\n".join(lines)
+    if skipped:
+        text += "\n\n⚠️ Пропущены (уже есть):\n" + "\n".join(skipped)
+    await query.edit_message_text(text)
     return ConversationHandler.END
 
 
@@ -657,6 +729,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\nДля PM:\n"
         "/newproject CODE Название — создать проект\n"
         "/addmember — добавить участника (ссылка-приглашение)\n"
+        "/addteam — добавить команду списком\n"
         "/newtask — мастер постановки задачи\n"
         "/tasks — активные задачи портфеля\n"
         "/settings — частота проверок и отчётов по проектам\n"
@@ -708,10 +781,19 @@ def register_handlers(app: Application) -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    addteam_conv = ConversationHandler(
+        entry_points=[CommandHandler("addteam", addteam_start)],
+        states={
+            AT_LIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, at_list)],
+            AT_ROLE: [CallbackQueryHandler(at_role, pattern=r"^at_role:")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     app.add_handler(reg_conv)
     app.add_handler(newtask_conv)
     app.add_handler(status_conv)
     app.add_handler(addmember_conv)
+    app.add_handler(addteam_conv)
     app.add_handler(CommandHandler("newproject", newproject))
     app.add_handler(CommandHandler("mytasks", mytasks))
     app.add_handler(CommandHandler("tasks", tasks_cmd))

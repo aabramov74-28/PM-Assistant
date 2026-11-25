@@ -40,6 +40,42 @@ def report_period(freq: str, today: date) -> tuple[date, date]:
     return today - timedelta(days=days), today
 
 
+# ---------------------------------------------------------------- список участников
+
+def parse_member_list(text: str) -> list[dict]:
+    """Разбор списка участников для массового добавления (/addteam).
+
+    Формат строки: «Имя Фамилия, @username, email» — username и email
+    необязательны, разделитель «,» или «;», порядок полей после имени
+    не важен. Строки с «#» — комментарии. Возвращает список словарей
+    {line, name, username, email} или {line, error}.
+    """
+    results: list[dict] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.replace(";", ",").split(",") if p.strip()]
+        if not parts:
+            continue
+        name_parts = [parts[0]]
+        username = email = None
+        for p in parts[1:]:
+            if p.startswith("@"):
+                username = p.lstrip("@")
+            elif "@" in p and "." in p:
+                email = p
+            else:
+                name_parts.append(p)  # «Иван, Петров, @ivan» → имя из двух частей
+        name = " ".join(name_parts).strip()
+        if len(name) < 2:
+            results.append({"line": lineno, "error": f"не распознано имя: «{line}»"})
+        else:
+            results.append({"line": lineno, "name": name,
+                            "username": username, "email": email})
+    return results
+
+
 def fmt_date(iso: str) -> str:
     d = date.fromisoformat(iso)
     return f"{d.day:02d}.{d.month:02d}.{d.year}"
