@@ -31,15 +31,50 @@ class Repository:
 
     # ---------- пользователи ----------
     def create_user(self, name: str, telegram_id: int | None, email: str | None,
-                    role: str = "executor") -> sqlite3.Row:
+                    role: str = "executor", username: str | None = None,
+                    invite_token: str | None = None) -> sqlite3.Row:
+        if username:
+            username = username.lstrip("@").lower()
         cur = self.conn.execute(
-            "INSERT INTO users (name, telegram_id, email, role) VALUES (?,?,?,?)",
-            (name, telegram_id, email, role),
+            """INSERT INTO users (name, telegram_id, email, role, username, invite_token)
+               VALUES (?,?,?,?,?,?)""",
+            (name, telegram_id, email, role, username, invite_token),
         )
         self.conn.commit()
         user = self.get_user(cur.lastrowid)
         self.audit("user_created", user["id"], f"{name} ({role})")
         return user
+
+    def create_invited_user(self, name: str, role: str, author_id: int | None,
+                            username: str | None = None,
+                            email: str | None = None) -> sqlite3.Row:
+        """PM регистрирует участника заранее: карточка + токен приглашения.
+
+        Telegram ID появится после перехода по ссылке-приглашению
+        (бот не может написать пользователю первым).
+        """
+        import secrets
+        token = secrets.token_urlsafe(8)
+        user = self.create_user(name, telegram_id=None, email=email, role=role,
+                                username=username, invite_token=token)
+        self.audit("user_invited", author_id, f"{name} (@{username or '—'})")
+        return user
+
+    def get_user_by_invite(self, token: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM users WHERE invite_token=?", (token,)).fetchone()
+
+    def link_telegram(self, user_id: int, telegram_id: int,
+                      username: str | None = None) -> None:
+        """Привязка Telegram-аккаунта к приглашённой карточке (одноразово)."""
+        if username:
+            username = username.lstrip("@").lower()
+        self.conn.execute(
+            """UPDATE users SET telegram_id=?, username=COALESCE(?, username),
+               invite_token=NULL WHERE id=?""",
+            (telegram_id, username, user_id))
+        self.conn.commit()
+        self.audit("user_activated", user_id, f"telegram_id={telegram_id}")
 
     def get_user(self, user_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()

@@ -11,10 +11,12 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id  INTEGER UNIQUE,
+    username     TEXT,                              -- @username в Telegram (без @)
     name         TEXT NOT NULL,
     email        TEXT,
     role         TEXT NOT NULL DEFAULT 'executor'
                  CHECK (role IN ('pm', 'executor', 'admin')),
+    invite_token TEXT,                              -- токен приглашения (deep link)
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -99,6 +101,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE projects ADD COLUMN report_frequency "
             "TEXT NOT NULL DEFAULT 'weekly'")
+    user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "username" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if "invite_token" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN invite_token TEXT")
     conn.commit()
 
 

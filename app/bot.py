@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 REG_NAME, REG_EMAIL, REG_ROLE = range(3)
 (NT_PROJECT, NT_TITLE, NT_DESC, NT_ASSIGNEE, NT_DEADLINE, NT_PRIORITY) = range(10, 16)
 ST_TEXT = 20
+AM_NAME, AM_USERNAME, AM_EMAIL, AM_ROLE = range(30, 34)
 
 TASK_CODE = re.compile(r"^TASK-\d{3,}$", re.IGNORECASE)
 
@@ -73,6 +74,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"Вы уже зарегистрированы как {user['name']} ({user['role']}).\n"
             f"Команды: /mytasks, /status, /help")
         return ConversationHandler.END
+    # Активация по ссылке-приглашению от PM: /start inv_<token>
+    if context.args and context.args[0].startswith("inv_"):
+        invited = repo(context).get_user_by_invite(context.args[0][4:])
+        if invited:
+            repo(context).link_telegram(
+                invited["id"], update.effective_user.id,
+                username=update.effective_user.username)
+            await update.message.reply_text(
+                f"✅ Аккаунт активирован: {invited['name']} ({invited['role']}).\n"
+                f"Теперь вы будете получать задачи и напоминания. "
+                f"Команды: /mytasks, /status, /help")
+            await notify_pms(
+                context.application,
+                f"✅ {invited['name']} активировал(а) аккаунт по приглашению.")
+            return ConversationHandler.END
+        await update.message.reply_text(
+            "Ссылка-приглашение недействительна или уже использована. "
+            "Зарегистрируемся обычным способом — введите имя и фамилию:")
+        return REG_NAME
     await update.message.reply_text(
         "Здравствуйте! Я — Ассистент PM проектного офиса.\n"
         "Для регистрации введите ваше имя и фамилию:")
@@ -109,6 +129,7 @@ async def reg_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         telegram_id=tg_id,
         email=context.user_data["reg_email"],
         role=role,
+        username=update.effective_user.username,
     )
     await query.edit_message_text(
         f"✅ Регистрация завершена: {user['name']}, роль «{user['role']}».\n"
@@ -134,6 +155,66 @@ async def newproject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Проект с кодом {code} уже существует.")
         return
     await update.message.reply_text(f"✅ Проект создан: {project['code']} — {project['name']}")
+
+
+# ------------------------------------------------- /addmember (PM приглашает)
+
+async def addmember_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """PM регистрирует участника заранее; участник активируется по ссылке."""
+    user = current_user(update, context)
+    if not is_pm(user, update.effective_user.id):
+        await update.message.reply_text("Добавлять участников может PM. /start для регистрации.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Добавление участника проекта.\nИмя и фамилия (или /cancel):")
+    return AM_NAME
+
+
+async def am_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["am_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Его @username в Telegram (или «-», если не знаете):")
+    return AM_USERNAME
+
+
+async def am_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["am_username"] = None if text == "-" else text.lstrip("@")
+    await update.message.reply_text("Корпоративный e-mail (или «-», чтобы пропустить):")
+    return AM_EMAIL
+
+
+async def am_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["am_email"] = None if text == "-" else text
+    keyboard = [[
+        InlineKeyboardButton("Исполнитель", callback_data="am_role:executor"),
+        InlineKeyboardButton("PM", callback_data="am_role:pm"),
+    ]]
+    await update.message.reply_text("Роль:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return AM_ROLE
+
+
+async def am_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    pm = current_user(update, context)
+    user = repo(context).create_invited_user(
+        name=context.user_data["am_name"],
+        role=query.data.split(":", 1)[1],
+        author_id=pm["id"] if pm else None,
+        username=context.user_data["am_username"],
+        email=context.user_data["am_email"],
+    )
+    bot_username = (await context.application.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start=inv_{user['invite_token']}"
+    uname = f"@{user['username']}" if user["username"] else "username не указан"
+    await query.edit_message_text(
+        f"✅ Участник добавлен: {user['name']} ({user['role']}, {uname}).\n\n"
+        f"Отправьте ему ссылку-приглашение — по ней аккаунт привяжется "
+        f"автоматически (бот не может написать первым):\n{link}\n\n"
+        f"До активации напоминания будут приходить на e-mail, если он указан.")
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------- /newtask
@@ -174,8 +255,10 @@ async def nt_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     context.user_data["nt_desc"] = "" if text == "-" else text
     users = [u for u in repo(context).list_users() if u["role"] in ("executor", "pm")]
-    keyboard = [[InlineKeyboardButton(u["name"], callback_data=f"nt_assignee:{u['id']}")]
-                for u in users]
+    keyboard = [[InlineKeyboardButton(
+        u["name"] if u["telegram_id"] else f"{u['name']} ⏳",
+        callback_data=f"nt_assignee:{u['id']}")]
+        for u in users]
     await update.message.reply_text("Исполнитель:",
                                     reply_markup=InlineKeyboardMarkup(keyboard))
     return NT_ASSIGNEE
@@ -573,6 +656,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/extend TASK-NNN ДД.ММ.ГГГГ причина — запросить перенос срока\n"
         "\nДля PM:\n"
         "/newproject CODE Название — создать проект\n"
+        "/addmember — добавить участника (ссылка-приглашение)\n"
         "/newtask — мастер постановки задачи\n"
         "/tasks — активные задачи портфеля\n"
         "/settings — частота проверок и отчётов по проектам\n"
@@ -614,9 +698,20 @@ def register_handlers(app: Application) -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    addmember_conv = ConversationHandler(
+        entry_points=[CommandHandler("addmember", addmember_start)],
+        states={
+            AM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, am_name)],
+            AM_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, am_username)],
+            AM_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, am_email)],
+            AM_ROLE: [CallbackQueryHandler(am_role, pattern=r"^am_role:")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     app.add_handler(reg_conv)
     app.add_handler(newtask_conv)
     app.add_handler(status_conv)
+    app.add_handler(addmember_conv)
     app.add_handler(CommandHandler("newproject", newproject))
     app.add_handler(CommandHandler("mytasks", mytasks))
     app.add_handler(CommandHandler("tasks", tasks_cmd))
